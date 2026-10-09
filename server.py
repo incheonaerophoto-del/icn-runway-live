@@ -165,30 +165,48 @@ class TrackingStore:
         self.provider = None
         self.err = None
         self.planes = []
+        self.polling = False
+        self.next_poll = 0
+        self.failures = 0
         self.tracks = {}
         self.events = deque(maxlen=200)
 
     def _fetch(self):
-        last_error = None
-        # Providers may change limits, coverage or access terms; fallback helps resilience.
-        urls = [
-            ('adsb.lol', 'https://api.adsb.lol/v2/point/37.4625/126.447/42'),
-            ('airplanes.live', 'https://api.airplanes.live/v2/point/37.4625/126.447/42'),
-        ]
-        for source, url in urls:
-            try:
-                req = urllib.request.Request(url, headers={
-                    'User-Agent': 'ICN-Runway-Live/1.0 (personal noncommercial ADS-B dashboard)',
-                    'Accept': 'application/json',
-                })
-                with urllib.request.urlopen(req, timeout=8) as response:
-                    payload = json.load(response)
-                if not isinstance(payload, dict) or not isinstance(payload.get('ac'), list):
-                    raise ValueError('올바르지 않은 ADS-B 응답')
-                return source, payload
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError, json.JSONDecodeError) as e:
-                last_error = f'{source}: {str(e)[:140]}'
-        raise RuntimeError(last_error or '사용 가능한 데이터 제공자가 없습니다')
+        req = urllib.request.Request(
+            'https://api.adsb.lol/v2/point/37.4625/126.447/42',
+            headers={'User-Agent': 'ICN-Runway-Live/1.1 (personal noncommercial ADS-B dashboard)', 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=25) as response:
+            payload = json.load(response)
+        if not isinstance(payload, dict) or not isinstance(payload.get('ac'), list):
+            raise ValueError('ADSB.lol 응답 형식 오류')
+        return 'adsb.lol', payload
+
+    def _refresh(self):
+        try:
+            source, payload = self._fetch()
+            planes = parse_planes(payload)
+            completed = time.time()
+            with self.lock:
+                self._ingest(planes, completed)
+                self.planes = planes
+                self.last_success = completed
+                self.provider = source
+                self.err = None
+                self.failures = 0
+        except Exception as exc:
+            with self.lock:
+                self.failures += 1
+                if isinstance(exc, urllib.error.HTTPError):
+                    self.err = f'ADSB.lol HTTP {exc.code}'
+                    delay = 300 if exc.code in (401, 403, 429) else 30
+                else:
+                    self.err = 'ADSB.lol 응답 지연 또는 일시적인 연결 실패'
+                    delay = min(120, 15 * 2 ** min(self.failures, 3))
+                self.next_poll = time.time() + delay
+                print(f'ADSB.lol update failed: {type(exc).__name__}: {exc}', flush=True)
+        finally:
+            with self.lock:
+                self.polling = False
 
     def _ingest(self, planes, stamp):
         for p in planes:
@@ -231,21 +249,16 @@ class TrackingStore:
     def get(self):
         with self.lock:
             now = time.time()
-            if now - self.last_poll >= CACHE_SECONDS:
+            if not self.polling and now >= self.next_poll and now - self.last_poll >= CACHE_SECONDS:
                 self.last_poll = now
-                try:
-                    source, payload = self._fetch()
-                    planes = parse_planes(payload)
-                    self._ingest(planes, now)
-                    self.planes = planes
-                    self.last_success = now
-                    self.provider = source
-                    self.err = None
-                except Exception as e:
-                    self.err = str(e)
+                self.next_poll = now + CACHE_SECONDS
+                self.polling = True
+                threading.Thread(target=self._refresh, daemon=True).start()
             age = now - self.last_success if self.last_success else None
             return {
                 'source': self.provider,
+                'polling': self.polling,
+                'retry_after': max(0, round(self.next_poll - now)),
                 'received_at': int(self.last_success) if self.last_success else None,
                 'seconds_old': round(age) if age is not None else None,
                 'fresh': age is not None and age < 70,
