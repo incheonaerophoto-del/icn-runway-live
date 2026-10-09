@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: icn-runway-live
+    runtime: python
+    plan: free
+    buildCommand: "echo 'Python standard library only'"
+    startCommand: "python server.py"
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
