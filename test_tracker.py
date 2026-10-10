@@ -78,3 +78,35 @@ class RefreshTests(unittest.TestCase):
             self.assertFalse(result['polling'])
 
 if __name__=='__main__':unittest.main()
+
+class PredictionTests(unittest.TestCase):
+    def plane(self, runway='33R', distance=5000, **kw):
+        r=server.RUNWAYS[runway];x=r['ox']-r['ux']*distance;y=r['oy']-r['uy']*distance
+        p=dict(hex='abc',flight='TEST1',lat=server.CENTER[0]+y/111320,
+            lon=server.CENTER[1]+x/(111320*math.cos(math.radians(server.CENTER[0]))),
+            altitude_ft=1000,track_deg=r['bearing'],speed_kt=150,
+            vertical_speed_fpm=-600,age_seconds=1,ground=False,runway=runway,phase='접근 중')
+        p.update(kw);return p
+    def test_all_runway_directions(self):
+        for r in server.RUNWAYS:
+            self.assertEqual(server.predict_runway(self.plane(r))[0]['runway'],r)
+    def test_reject_goaround_ground_stale_and_impossible_height(self):
+        for kw in [{'vertical_speed_fpm':900},{'ground':True},{'age_seconds':40},{'track_deg':None},{'altitude_ft':7000}]:
+            self.assertEqual(server.predict_runway(self.plane(distance=1000,**kw)),[])
+    def test_repeated_position_cannot_be_high_confidence(self):
+        hist={}
+        for t in [100,115,130]:
+            p=self.plane();server.enrich_predictions([p],hist,t)
+        self.assertEqual(p['prediction']['samples'],1)
+        self.assertNotEqual(p['prediction']['confidence'],'높음')
+    def test_moving_aligned_descent_confidence(self):
+        hist={}
+        for t,d in [(100,5000),(115,4000),(130,3000)]:
+            p=self.plane(distance=d,altitude_ft=d*.052/.3048);server.enrich_predictions([p],hist,t)
+        self.assertEqual(p['predicted_runway'],'33R')
+        self.assertEqual(p['prediction']['confidence'],'높음')
+        self.assertGreater(p['arrival_eta'],130)
+    def test_parallel_midpoint_is_ambiguous(self):
+        a=self.plane('33L');b=self.plane('33R');a['lat']=(a['lat']+b['lat'])/2;a['lon']=(a['lon']+b['lon'])/2
+        server.enrich_predictions([a],{},100)
+        self.assertTrue(a['prediction']['ambiguous']);self.assertIsNone(a['predicted_runway'])

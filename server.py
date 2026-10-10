@@ -106,6 +106,89 @@ def classify_approach(lat, lon, track, altitude):
     return best
 
 
+def predict_runway(p):
+    """Heuristic candidates, never a clearance or calibrated probability."""
+    alt, speed, track, vr = (p.get(k) for k in
+        ('altitude_ft', 'speed_kt', 'track_deg', 'vertical_speed_fpm'))
+    if (p.get('ground') or alt is None or track is None or speed is None
+            or not 100 <= alt <= 7500 or speed < 70 or (p.get('age_seconds') or 0) > 25
+            or (vr is not None and vr > 300)):
+        return []
+    px, py = xy((p['lat'], p['lon']))
+    candidates = []
+    for name, r in RUNWAYS.items():
+        dx, dy = px-r['ox'], py-r['oy']
+        along = dx*r['ux'] + dy*r['uy']
+        cross = abs(dx*r['uy'] - dy*r['ux'])
+        angle = angular_difference(track, r['bearing'])
+        tolerance = min(1100, 180 + max(0, -along)*.035)
+        if not -25000 <= along < 0 or cross > tolerance or angle > 30:
+            continue
+        glide = math.degrees(math.atan2(max(0, alt)*.3048, max(1, -along)))
+        if glide > 12:
+            continue
+        score = cross/tolerance + angle/35
+        closing = speed * .514444 * math.cos(math.radians(angle))
+        eta = max(0, -along)/closing
+        candidates.append({'runway': name, 'score': round(score, 3),
+            'cross_m': round(cross), 'heading_error': round(angle, 1), 'glide_angle': round(glide, 1),
+            'distance_nm': round(-along/1852, 1), 'eta_seconds': round(eta),
+            'along_m': round(along)})
+    return sorted(candidates, key=lambda c: (c['score'], c['runway']))[:3]
+
+
+def enrich_predictions(planes, history, stamp):
+    for p in planes:
+        key = p['hex']
+        old = history.get(key, {})
+        recent = stamp-old.get('seen', 0) < 90
+        candidates = predict_runway(p)
+        best = candidates[0] if candidates else None
+        ambiguous = len(candidates)>1 and candidates[1]['score']-best['score'] < .22
+        changed = not old
+        if old:
+            x,y=xy((p['lat'],p['lon']));ox,oy=xy(old['position'])
+            changed = math.hypot(x-ox,y-oy)>35
+        else:
+            changed = True
+        same = recent and best and old.get('runway') == best['runway']
+        samples = (old.get('samples',0)+int(changed)) if same else (1 if best else 0)
+        first = old.get('first',stamp) if same else stamp
+        confidence = '낮음'
+        if best and not ambiguous and best['score'] < .85:
+            confidence = '보통'
+            if (samples>=3 and stamp-first>=20 and best['cross_m']<160
+                    and best['heading_error']<10 and 1.5<best['glide_angle']<6.5 and p.get('vertical_speed_fpm') is not None
+                    and p['vertical_speed_fpm']<0 and p['age_seconds']<15):
+                confidence = '높음'
+        p['prediction'] = {'candidates': candidates, 'confidence': confidence if best else '판단 대기',
+            'ambiguous': ambiguous, 'samples': samples,
+            'reason': ('평행 활주로 구분 대기' if ambiguous else
+                       '중심선·진행방향·연속 하강 관측 일치' if confidence=='높음' else
+                       '위치·진행방향 기반, 추가 관측 필요' if best else
+                       '최종 접근 조건이 아직 충족되지 않음')}
+        p['arrival_eta'] = round(stamp+best['eta_seconds']) if best else None
+        p['predicted_runway'] = best['runway'] if best and not ambiguous else None
+        p['movement'] = 'arrival' if best else ('ground' if p['ground'] else 'other')
+        # Departure is an observed movement, not a guessed future takeoff slot.
+        dep = old.get('departure_at') if recent else None
+        if not p['ground'] and (p.get('vertical_speed_fpm') or 0)>300 and (p.get('altitude_ft') or 99999)<4500:
+            px,py=xy((p['lat'],p['lon']))
+            for r in RUNWAYS.values():
+                dx,dy=px-r['ox'],py-r['oy'];along=dx*r['ux']+dy*r['uy'];cross=abs(dx*r['uy']-dy*r['ux'])
+                if 0<along<r['length']+6000 and cross<350 and angular_difference(p.get('track_deg') or 0,r['bearing'])<20:
+                    dep=dep or round(stamp);p['movement']='departure';break
+        p['departure_observed_at'] = dep
+        if p['movement']=='departure':
+            p['runway']=None;p['phase']='출발 상승 추정'
+        elif not best and not p['ground'] and (p.get('vertical_speed_fpm') or 0)>300:
+            p['runway']=None;p['phase']='상승 중'
+        history[key]={'seen':stamp,'position':(p['lat'],p['lon']),
+            'runway':best['runway'] if best else None,'samples':samples,'first':first,'departure_at':dep}
+    for key in list(history):
+        if stamp-history[key]['seen']>1800: del history[key]
+
+
 def cargo_guess(raw, flight):
     description = str(raw.get('desc') or '').lower()
     typ = str(raw.get('t') or '').upper()
@@ -141,7 +224,7 @@ def parse_planes(payload):
             'ground': ground, 'speed_kt': round(speed) if speed is not None else None,
             'track_deg': round(track) if track is not None else None,
             'vertical_speed_fpm': round(vr) if vr is not None else None,
-            'age_seconds': round(seen_pos or 0, 1),
+            'age_seconds': round(seen_pos if seen_pos is not None else MAX_LAT_AGE, 1),
             'cargo_guess': cargo_guess(a, flight),
             'runway': approach['runway'] if approach else None,
             'distance_nm': approach['distance_nm'] if approach else None,
@@ -170,6 +253,7 @@ class TrackingStore:
         self.failures = 0
         self.tracks = {}
         self.events = deque(maxlen=200)
+        self.prediction_history = {}
 
     def _fetch(self):
         req = urllib.request.Request(
@@ -187,6 +271,7 @@ class TrackingStore:
             planes = parse_planes(payload)
             completed = time.time()
             with self.lock:
+                enrich_predictions(planes, self.prediction_history, completed)
                 self._ingest(planes, completed)
                 self.planes = planes
                 self.last_success = completed
@@ -256,6 +341,7 @@ class TrackingStore:
                 threading.Thread(target=self._refresh, daemon=True).start()
             age = now - self.last_success if self.last_success else None
             return {
+                'version': '3.0',
                 'source': self.provider,
                 'polling': self.polling,
                 'retry_after': max(0, round(self.next_poll - now)),
@@ -299,7 +385,9 @@ def build_demo():
                              vertical_speed_fpm=-650, age_seconds=2, cargo_guess=cargo,
                              runway=rw, distance_nm=round(km / 1.852, 1), along_m=-km*1000,
                              cross_m=0, phase='접근 중', last_seen=int(stamp)))
+    enrich_predictions(aircraft, {}, stamp)
     return {
+        'version': '3.0',
         'source': 'DEMO · 가상 데이터', 'received_at': int(stamp),
         'seconds_old': 0, 'fresh': True, 'error': None, 'aircraft': aircraft,
         'events': [],
@@ -316,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in ('/api/live', '/api/demo', '/health'):
             if path == '/health':
-                data = {'ok': True, 'time': datetime.now(timezone.utc).isoformat()}
+                data = {'ok': True, 'version': '3.0', 'time': datetime.now(timezone.utc).isoformat()}
             elif path == '/api/demo':
                 data = build_demo()
             else:
@@ -332,6 +420,9 @@ class Handler(BaseHTTPRequestHandler):
         static_assets = {
             '/manifest.webmanifest': ('manifest.webmanifest', 'application/manifest+json; charset=utf-8'),
             '/sw.js': ('sw.js', 'text/javascript; charset=utf-8'),
+            '/core.js': ('core.js', 'text/javascript; charset=utf-8'),
+            '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+            '/style.css': ('style.css', 'text/css; charset=utf-8'),
             '/icon-180.png': ('icon-180.png', 'image/png'),
             '/icon-192.png': ('icon-192.png', 'image/png'),
             '/icon-512.png': ('icon-512.png', 'image/png'),
